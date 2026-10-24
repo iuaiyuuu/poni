@@ -1,0 +1,44 @@
+name: probe-ja
+on:
+  push:
+    branches: [probe-ja-analyzer]
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, windows-2022, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Machine
+        shell: powershell
+        run: |
+          [Console]::OutputEncoding = [Text.Encoding]::UTF8
+          $os = Get-CimInstance Win32_OperatingSystem
+          "$($os.Caption) $($os.Version) OSLanguage=$($os.OSLanguage) MUI=$($os.MUILanguages -join ',')"
+          "culture=$(Get-Culture) ui=$(Get-UICulture) system=$(Get-WinSystemLocale)"
+          Get-WinUserLanguageList | ForEach-Object { "user language: $($_.LanguageTag) inputs=$($_.InputMethodTips -join ',')" }
+          "IME dirs (System32):"; Get-ChildItem C:\Windows\System32\IME -ErrorAction SilentlyContinue | ForEach-Object { "  $($_.Name)" }
+          "IME dirs (Windows):"; Get-ChildItem C:\Windows\IME -ErrorAction SilentlyContinue | ForEach-Object { "  $($_.Name)" }
+          "MSIME.Japan ProgID: $(Test-Path 'Registry::HKEY_CLASSES_ROOT\MSIME.Japan')"
+          Get-WindowsCapability -Online | Where-Object { $_.Name -like '*ja-JP*' } | ForEach-Object { "capability: $($_.Name) = $($_.State)" }
+          Get-ChildItem C:\Windows\System32\IME\IMEJP -ErrorAction SilentlyContinue | Select-Object -First 40 | ForEach-Object { "  IMEJP: $($_.Name) $($_.Length)" }
+      - name: Analyzer (STA and MTA)
+        shell: powershell
+        run: |
+          powershell -NoProfile -STA -File probe\analyze.ps1 -Out "$env:RUNNER_TEMP\ja.txt" -Tag "sta"
+          powershell -NoProfile -MTA -File probe\analyze.ps1 -Out "$env:RUNNER_TEMP\ja.txt" -Tag "mta"
+      - name: Without Japanese basic typing (if it was installed)
+        shell: powershell
+        run: |
+          $cap = Get-WindowsCapability -Online | Where-Object { $_.Name -like 'Language.Basic~~~ja-JP*' -and $_.State -eq 'Installed' }
+          if ($cap) {
+            "removing $($cap.Name)"
+            Remove-WindowsCapability -Online -Name $cap.Name | Out-String
+            powershell -NoProfile -File probe\analyze.ps1 -Out "$env:RUNNER_TEMP\ja.txt" -Tag "after-removing-basic"
+          } else { "Language.Basic ja-JP not installed here" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ja-${{ matrix.os }}
+          path: ${{ runner.temp }}/ja.txt
