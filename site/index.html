@@ -3,13 +3,29 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Oyen Poni</title>
-<meta name="description" content="Oyen Poni is a living notch for Windows 10 and 11: music with synced lyrics, a focus timer, your steps, a file shelf, tasks and your clipboard, one hover away at the top of your screen.">
+<title>Oyen Poni · A living notch for Windows</title>
+<meta name="description" content="Oyen Poni is a free, open-source living notch for Windows 10 and 11: music with synced lyrics, a focus timer, your steps, a file shelf, tasks and your clipboard, one hover away at the top of your screen.">
+<link rel="canonical" href="https://lucacadalora.github.io/poni/">
+<!-- Link previews (WhatsApp, X, LinkedIn, Facebook, Slack, Discord...). URLs are
+     absolute because the networks read these tags without loading the page. The
+     card is drawn by tools/make_share_card.py; bump its ?v= whenever it changes,
+     since every network caches a preview image by its URL. -->
 <meta property="og:type" content="website">
-<meta property="og:title" content="Oyen Poni">
-<meta property="og:description" content="A living notch for Windows 10 and 11: music with synced lyrics, a focus timer, your steps, a file shelf, tasks and your clipboard, one hover away.">
-<meta property="og:image" content="https://lucacadalora.github.io/poni/brand/social-preview.png">
+<meta property="og:site_name" content="Oyen Poni">
+<meta property="og:locale" content="en_US">
+<meta property="og:url" content="https://lucacadalora.github.io/poni/">
+<meta property="og:title" content="Oyen Poni · A living notch for Windows">
+<meta property="og:description" content="A free, open-source island at the top of your Windows screen: music with synced lyrics, a focus timer, your steps, a file shelf, tasks and your clipboard, one hover away.">
+<meta property="og:image" content="https://lucacadalora.github.io/poni/assets/share/oyen-poni-share.jpg?v=1">
+<meta property="og:image:type" content="image/jpeg">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="The Oyen Poni island hanging from the top of the screen, open on the Music page with synced lyrics, and Oyen the cat peeking over the island.">
 <meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="Oyen Poni · A living notch for Windows">
+<meta name="twitter:description" content="A free, open-source island at the top of your Windows screen: music with synced lyrics, a focus timer, your steps, a file shelf, tasks and your clipboard, one hover away.">
+<meta name="twitter:image" content="https://lucacadalora.github.io/poni/assets/share/oyen-poni-share.jpg?v=1">
+<meta name="twitter:image:alt" content="The Oyen Poni island hanging from the top of the screen, open on the Music page with synced lyrics, and Oyen the cat peeking over the island.">
 <link rel="icon" href="brand/oyen-poni-logo.svg" type="image/svg+xml">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -171,7 +187,7 @@ section { padding-block: 88px; }
 
 /* privacy + install */
 .facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
-.fact { border-top: 2px solid var(--ink); padding-top: 16px; display: grid; gap: 6px; }
+.fact { border-top: 2px solid var(--ink); padding-top: 16px; display: grid; gap: 6px; align-content: start; }
 .fact h3 { font-size: 20px; }
 .fact p { color: #3a3a3e; font-size: 15px; }
 .install { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 40px; align-items: start; }
@@ -250,7 +266,7 @@ footer a { color: var(--muted); }
           </a>
           <a class="btn btn-line" href="https://github.com/lucacadalora/poni">Source on GitHub</a>
         </div>
-        <p class="small">Free and open source (MIT) · About 1.7 MB · No account needed · <a href="https://github.com/lucacadalora/poni/releases">All releases</a></p>
+        <p class="small">Free and open source (MIT) · <span data-release="size">0.9 MB</span> download · No account needed · <a data-release="notes" href="https://github.com/lucacadalora/poni/releases/latest">What's new in <span data-release="version">0.1.6</span></a></p>
         <div class="look-switch" role="group" aria-label="Island look">
           <button type="button" data-look="classic" aria-pressed="true"><span class="dot"></span>Classic</button>
           <button type="button" data-look="oyen" aria-pressed="false"><span class="dot dot-oyen"></span>Oyen theme</button>
@@ -388,7 +404,7 @@ footer a { color: var(--muted); }
   <section class="theme" id="oyen">
     <div class="wrap">
       <div class="head">
-        <p class="eyebrow">New in 0.1.4 · Optional</p>
+        <p class="eyebrow">Optional theme</p>
         <h2>Oyen moves into the island</h2>
         <p>The island stays black and quiet by default. Switch on the Oyen theme and Oyen, the Oyenza cat, peeks over its edge, the same Oyen as in the Oyenza app.</p>
       </div>
@@ -452,7 +468,7 @@ footer a { color: var(--muted); }
       <div class="facts">
         <div class="fact"><h3>No account needed</h3><p>No sign-up and no tracking. Tasks, shelf and focus history are files in your own user folder.</p></div>
         <div class="fact"><h3>Clipboard in memory</h3><p>Copied text is never written to disk, and anything a password manager marks private is skipped.</p></div>
-        <div class="fact"><h3>Light on your PC</h3><p>Native Rust, no web view. It uses no CPU while nothing on the island is moving.</p></div>
+        <div class="fact"><h3>Smooth and light</h3><p>Drawn on your graphics card in step with your screen's refresh rate (60, 144 or 240 Hz). Native Rust, no web view, and no CPU while nothing moves.</p></div>
       </div>
     </div>
   </section>
@@ -467,7 +483,7 @@ footer a { color: var(--muted); }
         <ol class="steps">
           <li><div><b>Download the installer</b><p>Oyen-Poni-Setup.exe, from the latest release on GitHub. A portable zip is on the <a href="https://github.com/lucacadalora/poni/releases">Releases</a> page too.</p></div></li>
           <li><div><b>Run it</b><p>It installs just for you and needs no admin rights.</p></div></li>
-          <li><div><b>If Windows warns you</b><p>Builds aren't code-signed yet, so SmartScreen may say "Windows protected your PC". Choose More info, then Run anyway.</p></div></li>
+          <li><div><b>If Windows warns you</b><p>Builds aren't code-signed yet, so SmartScreen may say "Windows protected your PC". Choose More info, then Run anyway. If Smart App Control is on, Windows won't run unsigned apps at all; a Microsoft Store version is on the way.</p></div></li>
         </ol>
         <div class="ctas" style="display:flex;gap:12px;flex-wrap:wrap;margin-top:24px">
           <a class="btn btn-dark" href="https://github.com/lucacadalora/poni/releases/latest/download/Oyen-Poni-Setup.exe">Download for Windows</a>
@@ -516,6 +532,22 @@ footer a { color: var(--muted); }
     toggle.setAttribute('aria-label', v ? 'Close the island' : 'Open the island');
   }
   toggle.addEventListener('click', function () { open(island.dataset.open !== 'true'); });
+
+  // The download line follows the latest release on GitHub, so the page stays
+  // current between edits. Its own text is the fallback when the API is out of reach.
+  if (window.fetch) {
+    fetch('https://api.github.com/repos/lucacadalora/poni/releases/latest')
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (rel) {
+        if (!rel || !/^v\d/.test(rel.tag_name || '')) return;
+        function fill(key, f) { document.querySelectorAll('[data-release="' + key + '"]').forEach(f); }
+        var setup = (rel.assets || []).filter(function (a) { return a.name === 'Oyen-Poni-Setup.exe'; })[0];
+        fill('version', function (el) { el.textContent = rel.tag_name.slice(1); });
+        if (setup) fill('size', function (el) { el.textContent = (setup.size / 1e6).toFixed(1) + ' MB'; });
+        if (rel.html_url) fill('notes', function (el) { el.href = rel.html_url; });
+      })
+      .catch(function () {});
+  }
 })();
 </script>
 </body>
