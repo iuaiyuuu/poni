@@ -1319,7 +1319,7 @@ impl App {
             ToggleClipboard => s.clipboard_history = !s.clipboard_history,
             ToggleLyrics => s.lyrics = !s.lyrics,
             TogglePronunciation => s.lyrics_pronunciation = !s.lyrics_pronunciation,
-            ToggleHideFullscreen => s.hide_in_fullscreen = !s.hide_in_fullscreen,
+            SetHideFullscreen(hide) => s.hide_in_fullscreen = hide,
             ToggleSounds => s.sounds = !s.sounds,
             TogglePinned => self.st.pinned = !self.st.pinned,
             ToggleAutostart => {
