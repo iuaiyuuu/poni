@@ -16,13 +16,14 @@ use crate::app::App;
 use crate::clock;
 use crate::gfx::{Image, ImageData};
 use crate::icons::Icon;
-use crate::pages::PageKind;
+use crate::pages::{self, PageKind};
 use crate::paths;
 use crate::png;
 use crate::state::{
     AppState, Hud, HudKind, InlineAction, LyricsState, LyricsStatus, MediaSession, Notice, NoticeAction, OyenzaLink, OyenzaState, PhoneAsk,
     PhoneDrop, PhoneTransfer, PowerState, SysStats, VolumeState,
 };
+use crate::ui::wid;
 use poni_core::geom::{palette, Color, Point, Rect};
 use poni_core::health::{HealthDay, HealthSnapshot, HealthSource};
 use poni_core::lrc::parse_lrc;
@@ -31,6 +32,9 @@ use poni_core::phonedrop::QrMatrix;
 use poni_core::pomodoro::{Phase as PomoPhase, RunState};
 use poni_core::settings::{IdleStyle, Theme};
 use poni_core::shelf::ShelfItem;
+use poni_core::sysmon::{
+    AppUse, BatteryReading, CpuReading, DiskActivity, Drive, MemoryReading, Module, Monitor, NetReading, Reading, HISTORY_LEN,
+};
 use poni_core::timeline::Timeline;
 use serde::Serialize;
 use std::fs;
@@ -52,10 +56,12 @@ const MIN_STEPS: u32 = 3;
 const SETTLE_TIMEOUT: f64 = 3.0;
 /// Seconds to wait for a simulated tab click to switch the page.
 const CLICK_TIMEOUT: f64 = 1.5;
-/// Stop visiting scenes after this many seconds (the whole run must stay under 30 s).
-const SCENE_DEADLINE: f64 = 25.0;
+/// Stop visiting scenes after this many seconds. 36 scenes take about 22 s
+/// on CI's slowest run (Oyen theme, Japanese lyrics); the CI and Store test
+/// steps wait 120 s for the whole run, the Wine runner 180 s.
+const SCENE_DEADLINE: f64 = 40.0;
 /// Give up waiting for PNG writers at this point.
-const WRITE_DEADLINE: f64 = 28.5;
+const WRITE_DEADLINE: f64 = 43.5;
 /// One frame (layout + Direct2D render + present + readback) must fit in a 60 Hz frame.
 const FRAME_BUDGET_MS: f64 = 16.0;
 /// Frames re-rendered when the first sample misses the budget (filters scheduler noise).
@@ -179,6 +185,133 @@ fn fake_phone(scene: Scene) -> Option<PhoneDrop> {
     }
 }
 
+/// Paths of the sample apps (keys for their icons only; never opened) and their tile colours.
+const SAMPLE_ICONS: [(&str, u32); 4] = [
+    ("C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe", 0x1A9FD9),
+    ("C:\\Users\\Sample\\AppData\\Roaming\\Spotify\\Spotify.exe", 0x1DB954),
+    ("C:\\Windows\\explorer.exe", 0xF2C14E),
+    ("C:\\Users\\Sample\\AppData\\Local\\Programs\\Microsoft VS Code\\Code.exe", 0x2F80ED),
+];
+
+/// A plain rounded tile standing in for an app icon, laid out like the
+/// shell's icon pictures (the tile fills the middle 72 %).
+fn sample_icon(rgb: u32) -> Image {
+    const PX: u32 = 48;
+    let (r, g, b) = ((rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8);
+    let inset = PX as f32 * 0.14;
+    let (lo, hi, radius) = (inset, PX as f32 - inset, PX as f32 * 0.16);
+    let mut px = vec![0u8; (PX * PX * 4) as usize];
+    for y in 0..PX {
+        for x in 0..PX {
+            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+            // Distance outside the rounded square, smoothed over one pixel.
+            let dx = (lo + radius - fx).max(fx - (hi - radius)).max(0.0);
+            let dy = (lo + radius - fy).max(fy - (hi - radius)).max(0.0);
+            let a = (radius + 0.5 - (dx * dx + dy * dy).sqrt()).clamp(0.0, 1.0);
+            let i = ((y * PX + x) * 4) as usize;
+            let k = |c: u8| (f32::from(c) * a).round() as u8;
+            px[i..i + 4].copy_from_slice(&[k(b), k(g), k(r), (a * 255.0).round() as u8]);
+        }
+    }
+    ImageData::new(PX, PX, px)
+}
+
+fn sample_app(i: usize, name: &str, cpu: f32, memory: u64) -> AppUse {
+    let path = SAMPLE_ICONS[i].0;
+    let image = path.rsplit('\\').next().unwrap_or(path).to_lowercase();
+    AppUse { image, name: name.into(), path: Some(path.into()), pid: 1000 + i as u64, cpu, memory, processes: 1 }
+}
+
+/// The System page's sample minute (all made up): a laptop, or a desktop
+/// without a battery; nothing yet when the page has just opened.
+fn fake_system(scene: Scene) -> Monitor {
+    let mut m = Monitor::default();
+    if scene == Scene::SystemWaiting {
+        return m;
+    }
+    const MIB: f64 = 1024.0 * 1024.0;
+    for i in 0..HISTORY_LEN {
+        let t = i as f32;
+        let last = i + 1 == HISTORY_LEN;
+        let spike = if (38..45).contains(&i) { 0.22 * ((t - 38.0) / 6.0 * std::f32::consts::PI).sin() } else { 0.0 };
+        let cpu = if last { 0.23 } else { (0.19 + 0.05 * (t / 4.3).sin() + 0.03 * (t / 1.7 + 1.1).sin() + spike).clamp(0.03, 0.95) };
+        let burst = |at: usize, len: usize, peak: f64| if (at..at + len).contains(&i) { peak * (((i - at) as f64 + 0.5) / len as f64 * std::f64::consts::PI).sin() } else { 0.0 };
+        let read = if last { 1.2 * MIB } else { 0.15 * MIB + burst(12, 6, 6.5 * MIB) + burst(41, 4, 2.8 * MIB) };
+        let write = if last { 0.33 * MIB } else { 0.05 * MIB + burst(20, 9, 1.9 * MIB) };
+        let down = if last { 1.2 * MIB } else { 0.08 * MIB + burst(5, 14, 3.4 * MIB) + burst(46, 10, 1.6 * MIB) };
+        let up = if last { 0.082 * MIB } else { 0.02 * MIB + burst(25, 8, 0.6 * MIB) };
+        m.push(sample_reading(scene != Scene::SystemMemory, cpu, 0.6 + 0.004 * (t / 6.0).sin(), read, write, down, up));
+    }
+    m
+}
+
+fn sample_reading(laptop: bool, cpu: f32, mem: f32, read: f64, write: f64, down: f64, up: f64) -> Reading {
+    let total = GIB * 16;
+    Reading {
+        cpu: Some(CpuReading { load: cpu, user: cpu * 0.6, kernel: cpu * 0.4, logical: 12, mhz: Some(2_600), uptime_s: 3 * 86_400 + 4 * 3600 + 12 * 60 }),
+        memory: Some(MemoryReading {
+            total,
+            used: (total as f64 * f64::from(mem)) as u64,
+            committed: GIB * 121 / 10,
+            commit_limit: GIB * 184 / 10,
+            cached: GIB * 42 / 10,
+        }),
+        drives: vec![
+            Drive { root: "C:".into(), label: "Windows".into(), total: GIB * 476, free: GIB * 212, system: true },
+            Drive { root: "D:".into(), label: "Data".into(), total: GIB * 931, free: GIB * 640, system: false },
+        ],
+        disk: Some(DiskActivity { read_bps: read, write_bps: write, active: Some(0.03) }),
+        network: Some(NetReading {
+            online: true,
+            adapter: "Wi-Fi".into(),
+            ipv4: Some("192.168.1.42".into()),
+            down_bps: down,
+            up_bps: up,
+            received: GIB * 34 / 10,
+            sent: 410 * 1024 * 1024,
+        }),
+        battery: laptop.then(|| BatteryReading {
+            percent: 76,
+            secs_left: Some(2 * 3600 + 14 * 60),
+            design_mwh: Some(57_000),
+            full_mwh: Some(51_870),
+            cycles: Some(193),
+            rate_mw: Some(-8_200),
+            ..BatteryReading::default()
+        }),
+        top_cpu: vec![
+            sample_app(0, "Microsoft Edge", 0.091, GIB * 21 / 10),
+            sample_app(1, "Spotify", 0.042, 412 * 1024 * 1024),
+            sample_app(2, "Windows Explorer", 0.013, 96 * 1024 * 1024),
+        ],
+        top_memory: vec![
+            sample_app(0, "Microsoft Edge", 0.091, GIB * 21 / 10),
+            sample_app(3, "Visual Studio Code", 0.008, 940 * 1024 * 1024),
+            sample_app(1, "Spotify", 0.042, 412 * 1024 * 1024),
+        ],
+    }
+}
+
+/// Judge one reading from the real sources: the core readings must be
+/// there; the rest is reported (a build server has no battery or GPU counters).
+fn system_readings(r: Reading) -> (bool, String) {
+    let cpu = r.cpu.as_ref().filter(|c| (0.0..=1.0).contains(&c.load) && c.logical > 0);
+    let mem = r.memory.as_ref().filter(|m| m.total > 0 && m.used <= m.total);
+    let ok = cpu.is_some() && mem.is_some() && !r.drives.is_empty() && !r.top_memory.is_empty();
+    let apps: Vec<String> = r.top_memory.iter().map(|a| format!("{} ({}{})", a.name, poni_core::sysmon::fmt_bytes(a.memory), if a.path.is_some() { ", path" } else { "" })).collect();
+    let detail = format!(
+        "cpu {} · memory {} · drives {} · disk activity {} · network {} · battery {} · top memory {}",
+        cpu.map_or("missing".into(), |c| format!("{:.0}% of {} threads{}", c.load * 100.0, c.logical, c.mhz.map_or(String::new(), |m| format!(" at {m} MHz")))),
+        mem.map_or("missing".into(), |m| format!("{} of {}", poni_core::sysmon::fmt_bytes(m.used), poni_core::sysmon::fmt_bytes(m.total))),
+        if r.drives.is_empty() { "none".into() } else { r.drives.iter().map(|d| d.root.clone()).collect::<Vec<_>>().join(" ") },
+        if r.disk.is_some() { "yes" } else { "no" },
+        r.network.as_ref().map_or("unavailable".into(), |n| if n.online { format!("{} {}", n.adapter, n.ipv4.as_deref().unwrap_or("")) } else { "offline".into() }),
+        r.battery.as_ref().map_or("none".into(), |b| format!("{}%", b.percent)),
+        if apps.is_empty() { "none".into() } else { apps.join(", ") },
+    );
+    (ok, detail)
+}
+
 fn fake_stats() -> SysStats {
     SysStats {
         valid: true,
@@ -211,7 +344,7 @@ fn fake_oyenza(st: &AppState, scene: Scene, now: f64) -> OyenzaState {
     };
     let day = |n: i64| st.local.add_days(n).day_key();
     let link = match scene {
-        Scene::OyenzaSignIn => OyenzaLink::Connecting {
+        Scene::OyenzaSignIn | Scene::SettingsSigningIn => OyenzaLink::Connecting {
             code: "KPJX-TMNQ".into(),
             url: "https://oyenza.app/connect?code=KPJX-TMNQ".into(),
             // Pinned on every step, so the countdown reads 9:41 in the screenshot.
@@ -283,9 +416,25 @@ enum Scene {
     OyenzaSaved,
     /// The Health page signed in to Oyenza, before the phone sends any steps.
     HealthSignedIn,
+    /// Click the gear in the header on the Health page; expect Settings.
+    GearClick,
+    /// Settings while a sign-in code waits for approval.
+    SettingsSigningIn,
+    /// Settings signed in to Oyenza.
+    SettingsSignedIn,
+    /// System page on a desktop (no battery): Memory and its apps.
+    SystemMemory,
+    /// System page: the drives and disk activity.
+    SystemDrives,
+    /// System page: the network.
+    SystemNetwork,
+    /// System page: the laptop's battery.
+    SystemBattery,
+    /// System page just opened: no reading yet.
+    SystemWaiting,
 }
 
-const SCENES: [Scene; 30] = [
+const SCENES: [Scene; 39] = [
     Scene::IdleClock,
     Scene::IdleEyes,
     Scene::Media,
@@ -317,6 +466,15 @@ const SCENES: [Scene; 30] = [
     Scene::OyenzaSignIn,
     Scene::OyenzaSaved,
     Scene::HealthSignedIn,
+    Scene::GearClick,
+    Scene::SettingsSigningIn,
+    Scene::SettingsSignedIn,
+    Scene::Page(PageKind::System),
+    Scene::SystemMemory,
+    Scene::SystemDrives,
+    Scene::SystemNetwork,
+    Scene::SystemBattery,
+    Scene::SystemWaiting,
 ];
 
 impl Scene {
@@ -345,6 +503,15 @@ impl Scene {
             Scene::OyenzaSignIn => "page-oyenza-signin".into(),
             Scene::OyenzaSaved => "page-oyenza-saved".into(),
             Scene::HealthSignedIn => "page-health-signed-in".into(),
+            // Reached by clicking the gear: the signed-out Settings page.
+            Scene::GearClick => "page-settings".into(),
+            Scene::SettingsSigningIn => "page-settings-signing-in".into(),
+            Scene::SettingsSignedIn => "page-settings-signed-in".into(),
+            Scene::SystemMemory => "page-system-memory".into(),
+            Scene::SystemDrives => "page-system-drives".into(),
+            Scene::SystemNetwork => "page-system-network".into(),
+            Scene::SystemBattery => "page-system-battery".into(),
+            Scene::SystemWaiting => "page-system-waiting".into(),
         }
     }
 
@@ -356,6 +523,8 @@ impl Scene {
             Scene::HealthSignedOut => Some(PageKind::Health),
             Scene::OyenzaSignIn | Scene::OyenzaSaved => Some(PageKind::Oyenza),
             Scene::HealthSignedIn => Some(PageKind::Health),
+            Scene::GearClick | Scene::SettingsSigningIn | Scene::SettingsSignedIn => Some(PageKind::Settings),
+            Scene::SystemMemory | Scene::SystemDrives | Scene::SystemNetwork | Scene::SystemBattery | Scene::SystemWaiting => Some(PageKind::System),
             _ => None,
         }
     }
@@ -372,6 +541,8 @@ impl Scene {
                 | Scene::OyenzaSaved
                 | Scene::Page(PageKind::Oyenza)
                 | Scene::HealthSignedIn
+                | Scene::SettingsSigningIn
+                | Scene::SettingsSignedIn
         )
     }
 
@@ -478,7 +649,7 @@ enum Phase {
     Anim { seq: usize },
     Settle { i: usize, since: f64, steps: u32, stable: u32 },
     Click { i: usize },
-    ClickWait { i: usize, since: f64, from: PageKind },
+    ClickWait { i: usize, since: f64, from: PageKind, want: PageKind },
     Finish { since: f64 },
     Done(i32),
 }
@@ -555,6 +726,10 @@ impl SelfTest {
 
     /// Seed the app with fake data. Called once before the first frame.
     pub fn begin(&mut self, st: &mut AppState) {
+        // The real readers behind the System page (its scenes show sample
+        // readings); before the scene clock starts, as it takes a moment.
+        let (ok, detail) = system_readings(crate::services::sysmon::probe());
+        self.checks.push(check("system-readings", ok, detail));
         self.t0 = Instant::now();
         crate::pinfo!("selftest: output folder {}", self.dir.display());
         match fs::create_dir_all(&self.dir) {
@@ -579,29 +754,69 @@ impl SelfTest {
         let art = ImageData::new(ART_PX, ART_PX, make_art(ART_PX));
         self.art_color = Some(art.accent_color());
         self.art = Some(art);
-        let lrc = match self.lyrics_lang.as_deref() {
-            Some("ja") => LYRICS_JA,
-            Some("ko") => LYRICS_KO,
-            Some("zh") => LYRICS_ZH,
+        // PONI_SELFTEST_LRC=<file>: a real song for a one-off check on CI
+        // (fetched there at run time; song lyrics never go in the repo).
+        let file = std::env::var("PONI_SELFTEST_LRC").ok().and_then(|p| fs::read_to_string(p.trim()).ok());
+        let lrc = match (file.as_deref(), self.lyrics_lang.as_deref()) {
+            (Some(f), _) => f,
+            (None, Some("ja")) => LYRICS_JA,
+            (None, Some("ko")) => LYRICS_KO,
+            (None, Some("zh")) => LYRICS_ZH,
             _ => LYRICS_LRC,
         };
         let parsed = parse_lrc(lrc);
-        let lyric_ok = parsed.synced && parsed.lines.len() == 12 && parsed.line_index_at(TRACK_POS_S) == Some(4);
-        self.checks.push(check(
-            "lyrics-fixture",
-            lyric_ok,
-            format!("{} lines, synced {}, line at {TRACK_POS_S}s = {:?}", parsed.lines.len(), parsed.synced, parsed.line_index_at(TRACK_POS_S)),
-        ));
-        let ruby = crate::services::romanize::pronounce(&parsed);
-        if let Some(lang) = &self.lyrics_lang {
+        if file.is_none() {
+            let lyric_ok = parsed.synced && parsed.lines.len() == 12 && parsed.line_index_at(TRACK_POS_S) == Some(4);
+            self.checks.push(check(
+                "lyrics-fixture",
+                lyric_ok,
+                format!("{} lines, synced {}, line at {TRACK_POS_S}s = {:?}", parsed.lines.len(), parsed.synced, parsed.line_index_at(TRACK_POS_S)),
+            ));
+        }
+        // PONI_SELFTEST_ANALYZER: "required" (Windows CI) = Windows' own
+        // analyzer must work and every line must read, kanji lines included;
+        // "off" = read the song the way a PC without Windows' Japanese reading
+        // data does (Oyen Poni's own dictionary), every line too; "kana" = the
+        // way 0.1.11 and older read it there (kana lines only), for
+        // before/after pictures. Without it, Wine has no analyzer, so its
+        // lines come from Oyen Poni's own dictionary.
+        let analyzer = std::env::var("PONI_SELFTEST_ANALYZER").map(|v| v.trim().to_ascii_lowercase()).unwrap_or_default();
+        let texts: Vec<&str> = parsed.lines.iter().map(|l| l.text.trim()).collect();
+        let japanese = poni_core::romanize::song_script(&texts) == Some(poni_core::romanize::Script::Japanese);
+        if analyzer == "required" {
+            let works = crate::services::romanize::analyzer_works();
+            self.checks.push(check("japanese-analyzer", works.is_ok(), works.err().unwrap_or_else(|| "Windows' analyzer reads Japanese".into())));
+        }
+        let ruby = if japanese && analyzer == "off" {
+            crate::services::romanize::own_song(&texts)
+        } else if japanese && analyzer == "kana" {
+            let kana = |t: &str| if poni_core::romanize::needs_roman(t) { poni_core::romanize::japanese_kana_ruby(t).unwrap_or_default() } else { Vec::new() };
+            texts.iter().map(|t| kana(t)).collect()
+        } else {
+            // Read on a thread in the multithreaded apartment, the way the
+            // lyrics worker reads a real song (the UI thread here is
+            // single-threaded, and Windows' Japanese analyzer only works from one).
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    let _com = crate::services::http::MtaGuard::new();
+                    crate::services::romanize::pronounce(&parsed)
+                })
+                .join()
+                .unwrap_or_default()
+            })
+        };
+        let lang = self.lyrics_lang.clone().or_else(|| file.as_ref().map(|_| "lrc".to_string()));
+        if let Some(lang) = &lang {
             // The CI log shows how each line reads (on Windows the Japanese
             // readings come from the system's analyzer).
             let read = |p: &[poni_core::romanize::Ruby]| p.iter().filter(|r| !r.roman.is_empty()).map(|r| r.roman.as_str()).collect::<Vec<_>>().join(" ");
+            let needing = texts.iter().filter(|t| poni_core::romanize::needs_roman(t)).count();
             let lines_read = ruby.iter().filter(|p| p.iter().any(|r| !r.roman.is_empty())).count();
             for (line, p) in parsed.lines.iter().zip(&ruby) {
                 crate::pinfo!("selftest: [{lang}] {} -> {}", line.text, read(p));
             }
-            self.checks.push(check("lyrics-pronunciation", lines_read > 0, format!("{lines_read} of {} {lang} lines read in Latin letters", parsed.lines.len())));
+            let ok = if matches!(analyzer.as_str(), "required" | "off") { lines_read == needing } else { lines_read > 0 };
+            self.checks.push(check("lyrics-pronunciation", ok, format!("{lines_read} of {needing} {lang} lines read in Latin letters")));
         }
         self.lyrics = LyricsState { track_key: self.track_key.clone(), status: LyricsStatus::Found, lyrics: Some(parsed), source: "Sample".into(), ruby };
 
@@ -670,23 +885,33 @@ impl SelfTest {
             }
             Phase::Click { i } => {
                 let from = app.st.page;
-                let p = first_tab_point(app.island_body());
-                crate::pinfo!("selftest: clicking the first header tab at ({:.0}, {:.0}) DIP on page '{}'", p.x, p.y, from.key());
-                app.selftest_click(p);
-                self.phase = Phase::ClickWait { i, since: now, from };
+                // The first tab, or the gear (found by its widget id: its place
+                // depends on how wide the clock and date are).
+                let (what, at, want) = match SCENES[i] {
+                    Scene::GearClick => ("the gear", app.selftest_hit_center(wid(pages::GEAR_ID)), PageKind::Settings),
+                    _ => ("the first header tab", Some(first_tab_point(app.island_body())), PageKind::ALL[0]),
+                };
+                match at {
+                    Some(p) => {
+                        crate::pinfo!("selftest: clicking {what} at ({:.0}, {:.0}) DIP on page '{}'", p.x, p.y, from.key());
+                        app.selftest_click(p);
+                    }
+                    None => crate::pwarn!("selftest: {what} isn't on page '{}'", from.key()),
+                }
+                self.phase = Phase::ClickWait { i, since: now, from, want };
             }
-            Phase::ClickWait { i, since, from } => {
-                let want = PageKind::ALL[0];
+            Phase::ClickWait { i, since, from, want } => {
                 let page = app.st.page;
                 if page != from || now - since > CLICK_TIMEOUT {
                     let ok = from != want && page == want;
+                    let name = if SCENES[i] == Scene::GearClick { "gear-click" } else { "tab-click" };
                     self.checks.push(check(
-                        "tab-click",
+                        name,
                         ok,
                         format!("page '{}' -> '{}' after {:.0} ms (expected '{}')", from.key(), page.key(), (now - since) * 1000.0, want.key()),
                     ));
                     if !ok {
-                        crate::pwarn!("selftest: tab click did not switch to '{}' (page is '{}')", want.key(), page.key());
+                        crate::pwarn!("selftest: {name} did not switch to '{}' (page is '{}')", want.key(), page.key());
                     }
                     self.phase = Phase::Settle { i, since: now, steps: 0, stable: 0 };
                 }
@@ -707,7 +932,7 @@ impl SelfTest {
 
     fn next_phase(&self, i: usize, now: f64) -> Phase {
         match SCENES.get(i) {
-            Some(Scene::TabClick) => Phase::Click { i },
+            Some(Scene::TabClick | Scene::GearClick) => Phase::Click { i },
             Some(_) => Phase::Settle { i, since: now, steps: 0, stable: 0 },
             None if self.anim => Phase::Anim { seq: 0 },
             None => Phase::Finish { since: now },
@@ -767,6 +992,8 @@ impl SelfTest {
         st.pinned = false;
         st.drag_hover = scene == Scene::ShelfDrop;
         st.health = if matches!(scene, Scene::HealthSignedOut | Scene::HealthSignedIn) { None } else { self.health.clone() };
+        // Start with Windows as Settings shows it once read (it's read off the UI thread).
+        st.ui.autostart = Some(true);
         st.phone = fake_phone(scene);
         st.store.shelf.items = if scene == Scene::ShelfEmpty { Vec::new() } else { self.shelf_items.clone() };
         if scene != Scene::ShelfEmpty {
@@ -833,6 +1060,17 @@ impl SelfTest {
             _ => None,
         };
         st.oyenza = if scene.oyenza() { fake_oyenza(st, scene, now) } else { OyenzaState::default() };
+        st.system = fake_system(scene);
+        st.ui.system_module = match scene {
+            Scene::SystemMemory => Module::Memory,
+            Scene::SystemDrives => Module::Drives,
+            Scene::SystemNetwork => Module::Network,
+            Scene::SystemBattery => Module::Battery,
+            _ => Module::Cpu,
+        };
+        for (path, rgb) in SAMPLE_ICONS {
+            st.app_icons.entry(path.to_string()).or_insert_with(|| Some(sample_icon(rgb)));
+        }
         if let Some(p) = scene.page() {
             st.page = p;
         }

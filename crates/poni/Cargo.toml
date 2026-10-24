@@ -13,7 +13,9 @@ name = "poni"
 path = "src/main.rs"
 
 [dependencies]
-poni-core = { path = "../poni-core" }
+# ja-dict: Oyen Poni's own Japanese reading dictionary (3.8 MB) built into the
+# exe, for PCs where Windows has no Japanese reading data.
+poni-core = { path = "../poni-core", features = ["ja-dict"] }
 serde.workspace = true
 serde_json.workspace = true
 
@@ -75,8 +77,10 @@ features = [
     "Win32_System_Com_StructuredStorage",
     "Win32_System_DataExchange",
     "Win32_System_LibraryLoader",
+    "Win32_System_IO",
     "Win32_System_Memory",
     "Win32_System_Ole",
+    "Win32_System_Performance",
     "Win32_System_Power",
     "Win32_System_ProcessStatus",
     "Win32_System_Registry",
@@ -93,6 +97,7 @@ features = [
     "Win32_UI_Shell_Common",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_UI_WindowsAndMessaging",
+    "Wdk_System_SystemInformation",
 ]
 
 [build-dependencies]

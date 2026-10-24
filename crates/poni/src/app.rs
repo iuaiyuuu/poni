@@ -26,6 +26,7 @@ use poni_core::settings::{IdleStyle, Settings, Theme};
 use poni_core::settings::MonitorChoice;
 use poni_core::store::{load_json, parse_json, save_json_atomic, LoadOutcome, Store};
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use windows::core::{w, Result};
@@ -317,6 +318,12 @@ pub struct App {
     raises_left: u8,
     shown: bool,
     stats_on: bool,
+    /// The System page's sampler thread (started the first time the page opens).
+    sysmon: Option<services::sysmon::SysMon>,
+    sysmon_on: bool,
+    /// App icons the System page asked for and hasn't got yet (the Shelf's
+    /// thumbnail worker answers both pages with the same event).
+    icon_wait: HashSet<String>,
     tray: Option<Tray>,
     taskbar_created_msg: u32,
     selftest: Option<selftest::SelfTest>,
@@ -341,12 +348,16 @@ pub struct App {
     display_off: bool,
     tray_retries: u32,
     /// Content of the previous mode, fading out while the outline morphs:
-    /// (mode, start time, its geometry).
-    outgoing: Option<(Mode, f64, Geom)>,
+    /// (mode, start time, its geometry, the opacity it fades from).
+    outgoing: Option<(Mode, f64, Geom, f32)>,
     /// A page switch in progress: (from page, start time, slide direction).
     page_anim: Option<(PageKind, f64, f32)>,
     /// Where the hover (dwell) timer was last armed; None when it isn't.
     hover_arm: Option<Point>,
+    /// The pointer left the open island: close it on the next frame.
+    collapse_due: bool,
+    /// When the pointer last closed the island by leaving it.
+    left_at: f64,
     /// Phone drop's web server while the Shelf's phone panel is open.
     phone: Option<services::phonedrop::PhoneDrop>,
     /// The Shelf paths last handed to it (to notice changes).
@@ -375,6 +386,14 @@ const PAGE_SWITCH: f64 = 0.26;
 /// Pointer travel (DIPs) that restarts the hover dwell: the island opens
 /// only once the pointer rests on it, not when it brushes past.
 const DWELL_SLOP: f32 = 4.0;
+/// The pointer coming back onto the island this soon after leaving it
+/// (while it is still shrinking) opens it again at once, from where the
+/// outline is: overshooting an edge costs no close-and-reopen.
+const REOPEN_S: f64 = 0.3;
+/// A hold that kept the island open (typing, a file drag, Phone drop, the
+/// pin) ended while the pointer is elsewhere: close after this grace, so
+/// the change can be seen.
+const HOLD_GRACE_MS: u32 = 380;
 /// Collapsed pill growth (w, h, radius) while the pointer is on it.
 const HOVER_LIFT: (f32, f32, f32) = (12.0, 4.0, 2.0);
 /// How long the inline notice pill shows its check mark (seconds).
@@ -385,6 +404,13 @@ const CONTENT_SCALE_FROM: f32 = 0.94;
 const CONTENT_DROP: f32 = 6.0;
 /// Smallest scale the outgoing content shrinks to as the outline narrows.
 const GHOST_MIN_SCALE: f32 = 0.6;
+
+/// How much of the outgoing content still shows `age` seconds into its fade
+/// (a smoothstep: it holds, then leaves).
+fn outgoing_left(age: f64) -> f32 {
+    let t = ((age / OUTGOING_FADE) as f32).clamp(0.0, 1.0);
+    1.0 - t * t * (3.0 - 2.0 * t)
+}
 
 impl App {
     #[allow(clippy::too_many_arguments)]
@@ -450,6 +476,9 @@ impl App {
             raises_left: 0,
             shown: false,
             stats_on: false,
+            sysmon: None,
+            sysmon_on: false,
+            icon_wait: HashSet::new(),
             tray: None,
             taskbar_created_msg,
             selftest,
@@ -469,6 +498,8 @@ impl App {
             outgoing: None,
             page_anim: None,
             hover_arm: None,
+            collapse_due: false,
+            left_at: f64::NEG_INFINITY,
             phone: None,
             phone_offer: Vec::new(),
         })
@@ -664,7 +695,7 @@ impl App {
                         self.hovering = false;
                         self.input.mouse = None;
                         self.cancel_hover();
-                        self.maybe_schedule_collapse();
+                        self.pointer_left();
                         self.request_frame();
                     }
                     return Some(LRESULT(0));
@@ -672,12 +703,16 @@ impl App {
                 self.input.mouse = Some(p);
                 if !self.hovering {
                     self.hovering = true;
+                    self.collapse_due = false;
                     unsafe {
                         let mut tme = TRACKMOUSEEVENT { cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32, dwFlags: TME_LEAVE, hwndTrack: self.hwnd, dwHoverTime: 0 };
                         let _ = TrackMouseEvent(&mut tme);
                         let _ = KillTimer(self.hwnd, TIMER_COLLAPSE);
                     }
-                    if !self.expanded {
+                    if !self.expanded && clock::mono() - self.left_at < REOPEN_S {
+                        // Back onto the island while it is still closing.
+                        self.expand();
+                    } else if !self.expanded {
                         self.arm_hover(p);
                     }
                 } else if let Some(p0) = self.hover_arm.filter(|_| !self.expanded) {
@@ -694,7 +729,7 @@ impl App {
                 self.hovering = false;
                 self.input.mouse = None;
                 self.cancel_hover();
-                self.maybe_schedule_collapse();
+                self.pointer_left();
                 self.request_frame();
                 Some(LRESULT(0))
             }
@@ -754,7 +789,8 @@ impl App {
                     self.input.mouse = None;
                 }
                 if !self.hovering {
-                    self.maybe_schedule_collapse();
+                    // Released outside after a press inside (a slider drag).
+                    self.pointer_left();
                 }
                 self.request_frame();
                 Some(LRESULT(0))
@@ -765,7 +801,7 @@ impl App {
                     self.input.down = false;
                     self.input.pressed_id = None;
                     if !self.hovering {
-                        self.maybe_schedule_collapse();
+                        self.pointer_left();
                     }
                     self.request_frame();
                 }
@@ -998,7 +1034,7 @@ impl App {
                 unsafe {
                     let _ = KillTimer(self.hwnd, TIMER_COLLAPSE);
                 }
-                if !self.hovering && !self.st.pinned && !self.text_focus && !self.drag_hover && self.input.pressed_id.is_none() && !self.phone_holds() {
+                if self.free_to_collapse() {
                     self.collapse();
                 }
             }
@@ -1182,7 +1218,7 @@ impl App {
                 self.end_sign_in();
                 self.st.oyenza = crate::state::OyenzaState::default();
                 let (title, subtitle) =
-                    if by_server { ("Oyenza disconnected", "Sign in again from the tray") } else { ("Disconnected from Oyenza", "Sign in again any time from the tray") };
+                    if by_server { ("Oyenza disconnected", "Sign in again in Settings") } else { ("Disconnected from Oyenza", "Sign in again any time in Settings") };
                 self.st.notify(Icon::Unlink, palette::TEXT_DIM, title, subtitle, 6.0, None);
             }
         }
@@ -1327,6 +1363,8 @@ impl App {
                 if let Err(e) = crate::autostart::set_enabled(!on) {
                     pwarn!("autostart toggle failed: {e}");
                 }
+                // The Settings page's switch follows.
+                crate::autostart::report(self.sink.clone(), None);
             }
             OpenSettings => {
                 if !paths::settings_path().exists() {
@@ -1529,9 +1567,25 @@ impl App {
                 }
             }
             AppEvent::ShelfThumb { path, image } => {
-                self.st.shelf_thumbs.insert(path, image);
+                // The answer to an app icon the System page asked for (only that
+                // answer touches its icons), and to the Shelf when it asked too.
+                let ours = self.icon_wait.remove(&path);
+                let for_shelf = !ours || self.st.shelf_thumbs.contains_key(&path);
+                if ours {
+                    let px = pages::system::icon_px(self.gfx.scale());
+                    self.st.app_icons.insert(path.clone(), image.as_ref().map(|i| pages::system::shrink_icon(i, px)));
+                }
+                if for_shelf {
+                    self.st.shelf_thumbs.insert(path, image);
+                }
             }
             AppEvent::Stats(s) => self.st.stats = s,
+            AppEvent::System(r) => {
+                // A reading still on its way when the page closed is dropped.
+                if self.sysmon_on {
+                    self.st.system.push(*r);
+                }
+            }
             AppEvent::ClipboardText(t) => {
                 if self.own_clip.as_deref() == Some(t.as_str()) {
                     self.own_clip = None;
@@ -1542,6 +1596,7 @@ impl App {
             AppEvent::AppleMusic(status) => self.on_apple_music(status),
             AppEvent::Phone(e) => self.on_phone(e),
             AppEvent::Oyenza(ev) => self.on_oyenza(ev),
+            AppEvent::Autostart(on) => self.st.ui.autostart = Some(on),
             AppEvent::Log(s) => pinfo!("{s}"),
         }
         if let Some(before) = media_before {
@@ -1614,9 +1669,14 @@ impl App {
                 self.blur_text();
             }
             self.set_stats(false);
+            self.set_sysmon(false);
             self.st.ui.clip_flash = None;
             // Sums shown in the Oyenza tab hide again.
             self.st.oyenza.reveal = false;
+            // Settings closes with the island: it opens again on the page it was opened from.
+            if self.st.page == PageKind::Settings {
+                self.st.page = self.st.ui.before_settings.take().filter(|p| pages::tabs(&self.st).contains(p)).unwrap_or(PageKind::ALL[0]);
+            }
             // A notice that arrived while expanded gets its full time now.
             let min_until = self.st.now + 4.0;
             if let Some(n) = self.st.notice.as_mut() {
@@ -1626,10 +1686,34 @@ impl App {
         self.request_frame();
     }
 
+    /// Nothing holds the open island: no pointer on it, no pin, typing,
+    /// file drag, press or Phone drop.
+    fn free_to_collapse(&self) -> bool {
+        !self.hovering && !self.st.pinned && !self.text_focus && !self.drag_hover && self.input.pressed_id.is_none() && !self.phone_holds()
+    }
+
+    /// The pointer left the open island: it starts closing on the next frame,
+    /// or after `collapse_delay_ms` when the user set a grace.
+    fn pointer_left(&mut self) {
+        if !self.expanded || !self.free_to_collapse() {
+            return;
+        }
+        match self.st.settings.collapse_delay_ms {
+            0 => {
+                self.collapse_due = true;
+                self.request_frame();
+            }
+            ms => unsafe {
+                SetTimer(self.hwnd, TIMER_COLLAPSE, ms, None);
+            },
+        }
+    }
+
+    /// A hold ended (see [`HOLD_GRACE_MS`]): close soon unless the pointer is on the island.
     fn maybe_schedule_collapse(&mut self) {
         if self.expanded && !self.hovering && !self.st.pinned && !self.text_focus && !self.drag_hover && !self.phone_holds() {
             unsafe {
-                SetTimer(self.hwnd, TIMER_COLLAPSE, self.st.settings.collapse_delay_ms.max(50), None);
+                SetTimer(self.hwnd, TIMER_COLLAPSE, HOLD_GRACE_MS.max(self.st.settings.collapse_delay_ms), None);
             }
         }
     }
@@ -1646,6 +1730,31 @@ impl App {
             } else {
                 let _ = KillTimer(self.hwnd, TIMER_STATS);
             }
+        }
+    }
+
+    /// Readings for the System page run only while it is open; each opening
+    /// starts a fresh minute of history.
+    fn set_sysmon(&mut self, on: bool) {
+        if on == self.sysmon_on {
+            return;
+        }
+        self.sysmon_on = on;
+        // The self-test shows sample readings; the real sources get their own check.
+        if self.selftest.is_some() {
+            return;
+        }
+        if on {
+            self.st.system.clear();
+            if self.sysmon.is_none() {
+                match services::sysmon::SysMon::start(self.sink.clone()) {
+                    Ok(s) => self.sysmon = Some(s),
+                    Err(e) => pwarn!("sysmon: couldn't start ({e})"),
+                }
+            }
+        }
+        if let Some(s) = &self.sysmon {
+            s.run(on);
         }
     }
 
@@ -1826,12 +1935,27 @@ impl App {
         self.tick();
         let now = self.st.now;
 
+        // The pointer left the open island since the last frame: the close
+        // starts on this frame, no timer in between.
+        if std::mem::take(&mut self.collapse_due) && self.expanded && self.free_to_collapse() {
+            self.collapse();
+            self.left_at = clock::mono();
+        }
+
         let target = self.target_mode();
         let mut retarget = false;
         if target != self.mode {
             let new_content = activities::content_key(&target) != activities::content_key(&self.mode);
+            // A morph turned around mid-fade (the pointer came back while the
+            // island closed): the content coming back is the one still fading
+            // out, and it fades back in from where it is, not from nothing.
+            let back = self
+                .outgoing
+                .filter(|o| new_content && activities::content_key(&o.0) == activities::content_key(&target))
+                .map(|(_, t0, _, from)| from * outgoing_left(now - t0));
             if new_content {
-                self.outgoing = Some((self.mode, now, self.island.target()));
+                // The leaving content fades from how visible it is now.
+                self.outgoing = Some((self.mode, now, self.island.target(), self.island.content_alpha()));
             }
             if let (Mode::Expanded(a), Mode::Expanded(b)) = (self.mode, target) {
                 if a != b {
@@ -1841,6 +1965,9 @@ impl App {
             }
             self.motion_name = motion_name(&self.mode, &target);
             self.island.set_target(self.geom_for(&target), now, new_content);
+            if let Some(a) = back {
+                self.island.resume_content(a);
+            }
             self.mode = target;
             retarget = true;
         } else {
@@ -1861,6 +1988,7 @@ impl App {
         }
         let dt = dt.clamp(0.0, 0.05) as f32;
         self.set_stats(self.mode == Mode::Expanded(PageKind::Today));
+        self.set_sysmon(self.mode == Mode::Expanded(PageKind::System));
         self.island.step(dt, now);
         self.ensure_room();
         self.note_motion(retarget, rendered_at, period, dt as f64);
@@ -1933,13 +2061,12 @@ impl App {
                 // shrinking with the outline instead of being sliced, and
                 // fading out on a smoothstep (it holds, then leaves). Drawn as
                 // one layer, so it shrinks as a picture. Ghost input: no clicks.
-                if let Some((m, t0, g)) = self.outgoing {
-                    let t = ((now - t0) / OUTGOING_FADE) as f32;
-                    if t >= 1.0 {
+                if let Some((m, t0, g, from)) = self.outgoing {
+                    if now - t0 >= OUTGOING_FADE {
                         self.outgoing = None;
                     } else {
                         let old_body = Rect::new(body.center().x - g.w / 2.0, body.y, g.w, g.h);
-                        let alpha = 1.0 - t * t * (3.0 - 2.0 * t);
+                        let alpha = from * outgoing_left(now - t0);
                         let xf = scale_about(pivot, (geom.w / g.w.max(1.0)).clamp(GHOST_MIN_SCALE, 1.0));
                         let st = &mut self.st;
                         canvas.layered(old_body, alpha, xf, |c| {
@@ -2218,6 +2345,29 @@ impl App {
         pinfo!("notice: inline action {a:?} done");
     }
 
+    fn set_page(&mut self, p: PageKind) {
+        if p != self.st.page {
+            self.st.page = p;
+            // Settings is never where the island opens next time.
+            if p != PageKind::Settings {
+                self.st.store.last_page = p.key().to_string();
+                unsafe {
+                    SetTimer(self.hwnd, TIMER_SAVE, 800, None);
+                }
+            } else {
+                crate::autostart::report(self.sink.clone(), None);
+            }
+            self.set_stats(p == PageKind::Today && self.expanded);
+            self.set_sysmon(p == PageKind::System && self.expanded);
+            if self.text_focus {
+                self.blur_text();
+            }
+            if p == PageKind::Oyenza {
+                self.oyenza(OyenzaCmd::Refresh);
+            }
+        }
+    }
+
     fn run_commands(&mut self, deferred: &mut Vec<Deferred>) {
         let cmds = std::mem::take(&mut self.st.cmds);
         for c in cmds {
@@ -2263,22 +2413,19 @@ impl App {
                 Command::SaveStore => unsafe {
                     SetTimer(self.hwnd, TIMER_SAVE, 800, None);
                 },
-                Command::SetPage(p) => {
-                    if p != self.st.page {
-                        self.st.page = p;
-                        self.st.store.last_page = p.key().to_string();
-                        unsafe {
-                            SetTimer(self.hwnd, TIMER_SAVE, 800, None);
-                        }
-                        self.set_stats(p == PageKind::Today && self.expanded);
-                        if self.text_focus {
-                            self.blur_text();
-                        }
-                        if p == PageKind::Oyenza {
-                            self.oyenza(OyenzaCmd::Refresh);
-                        }
+                Command::SetPage(p) => self.set_page(p),
+                Command::OpenSystem(m) => {
+                    self.st.ui.system_module = m;
+                    self.set_page(PageKind::System);
+                }
+                Command::LoadAppIcon(path) => {
+                    if !self.st.app_icons.contains_key(&path) {
+                        self.st.app_icons.insert(path.clone(), None);
+                        self.icon_wait.insert(path.clone());
+                        services::imaging::load_thumb_async(path, self.sink.clone());
                     }
                 }
+                Command::OpenTaskManager => shell::open_task_manager(),
                 Command::SetPinned(b) => {
                     self.st.pinned = b;
                     if !b {
@@ -2289,6 +2436,10 @@ impl App {
                 Command::Play(s) => services::sound::play(s),
                 Command::OpenUrl(u) => shell::open(&u),
                 Command::WantStats(b) => self.set_stats(b),
+                Command::SetAutostart(on) => {
+                    self.st.ui.autostart = Some(on);
+                    crate::autostart::report(self.sink.clone(), Some(on));
+                }
                 Command::Phone(c) => self.phone_cmd(c),
                 Command::Oyenza(c) => self.oyenza(c),
             }
@@ -2516,6 +2667,11 @@ impl App {
     pub fn selftest_hover(&mut self, p: Option<Point>) {
         self.input.mouse = p;
         self.hovering = p.is_some();
+    }
+
+    /// The middle of a widget drawn in the last frame, found by its id.
+    pub fn selftest_hit_center(&self, id: crate::ui::WidgetId) -> Option<Point> {
+        self.hits.iter().find(|h| h.id == id).map(|h| h.rect.center())
     }
 
     pub fn selftest_click(&mut self, p: Point) {

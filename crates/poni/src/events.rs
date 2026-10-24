@@ -128,10 +128,14 @@ pub enum AppEvent {
     DragHover(bool),
     ShelfThumb { path: String, image: Option<Image> },
     Stats(SysStats),
+    /// A System page reading (`services::sysmon`, only while the page is open).
+    System(Box<poni_core::sysmon::Reading>),
     ClipboardText(String),
     /// Phone drop's server: a phone opened the page, asked, sent, gave up.
     Phone(poni_core::phonedrop::Event),
     Oyenza(OyenzaEvent),
+    /// Start with Windows is on (true) or off, read for the Settings page.
+    Autostart(bool),
     /// Free-form log line from a service thread.
     Log(String),
 }
