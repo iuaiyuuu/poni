@@ -61,7 +61,7 @@ Right-click the island or the tray icon for options:
 - the theme: Classic or Oyen
 - the idle look: clock, eyes (Oyen in his theme), minimal, or hidden until you hover
 - lyrics, clipboard history and sounds
-- hide in full-screen apps
+- hide in full-screen apps (turn it off to keep the island on top of borderless games and videos; a game in exclusive full-screen mode still covers it)
 - start with Windows, and quit
 
 ## Install
